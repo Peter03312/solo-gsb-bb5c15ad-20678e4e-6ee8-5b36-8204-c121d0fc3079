@@ -497,3 +497,54 @@ def test_legacy_single_ship_endpoints_unchanged(client):
     body = {k: v for k, v in plan.items() if k != "revision"}
     r = client.post("/api/trips/confirm", json=body)
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 10. 正航时回路：批次预排 / 确认复算与单船一致，不剪较长同刻前缀
+# ---------------------------------------------------------------------------
+
+def test_batch_positive_time_loop_matches_single(client):
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1)
+    s2 = add_segment(client, "B", "C", 1)
+    s3 = add_segment(client, "C", "B", 1)
+    s4 = add_segment(client, "B", "D", 1, depth=0.5)
+    levels = {m: 0.0 for m in range(0, 3)}
+    levels[3] = 3.0
+    rev = seed_initial_revision(levels)
+
+    ship = {
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 4,
+        "draft": 1.0, "height": 0.0, "margin": 0.0,
+    }
+
+    # 单船预排：(1,2,3,4)，分钟 4 抵达
+    single = client.post("/api/trips/plan", json={**ship, "revision": rev})
+    assert single.status_code == 200, single.text
+    assert [l["seg_id"] for l in single.json()["itinerary"]] == [s1, s2, s3, s4]
+
+    # 批次预排：同一艘船（2 艘下限），结果与单船一致
+    other = {"origin": "A", "destination": "B",
+             "start_minute": 0, "window_minutes": 4,
+             "draft": 1.0, "height": 0.0, "margin": 0.0}
+    r = _batch_plan(client, [ship, other], rev)
+    assert r.status_code == 200, r.text
+    plan = r.json()
+    assert [l["seg_id"] for l in plan["ships"][0]["itinerary"]] == [s1, s2, s3, s4]
+    assert plan["ships"][0]["arrival_minute"] == 4
+
+    # 批次确认：复算与预排一致（前船拟占用不影响自身结论），快照按新结果固化
+    r = _batch_confirm(client, plan, "loop-key-1", rev)
+    assert r.status_code == 201, r.text
+    confirmed = r.json()
+    assert [l["seg_id"] for l in confirmed["trips"][0]["itinerary"]] == \
+        [s1, s2, s3, s4]
+
+    # 同键同内容重放：200 + replayed=true，结果不变
+    r = _batch_confirm(client, plan, "loop-key-1", rev)
+    assert r.status_code == 200
+    assert r.json()["replayed"] is True
+    assert [l["seg_id"] for l in r.json()["trips"][0]["itinerary"]] == \
+        [s1, s2, s3, s4]

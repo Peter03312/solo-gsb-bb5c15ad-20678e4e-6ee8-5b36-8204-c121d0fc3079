@@ -560,3 +560,39 @@ def test_review_of_safe_berth_trip_unchanged(client):
     _put_calendar(client, "B1", [])
     out = client.post(f"/api/trips/{tid}/review").json()
     assert out["safe"] is True and out["reschedule"] is None
+
+
+# ---- 正航时回路下的泊位模式择优 -----------------------------------------------------
+
+def test_berth_positive_time_loop_keeps_longer_lex_prefix(client):
+    # 同题面回路图：1 A->B、2 B->C、3 C->B、4 B->D，航时均 1；4 仅分钟 3 可行。
+    # 泊位 D1 作业 1 分钟：(1,2,3,4) 分钟 4 抵达即开工，序列字典序优于 (1,4)。
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1)
+    s2 = add_segment(client, "B", "C", 1)
+    s3 = add_segment(client, "C", "B", 1)
+    s4 = add_segment(client, "B", "D", 1, depth=0.5)
+    levels = {m: 0.0 for m in range(0, 5)}
+    levels[3] = 3.0
+    rev = seed_initial_revision(levels)
+    _add_berth(client, "D", "D1")
+    _put_calendar(client, "D1", [{"start_minute": 0, "end_minute": 1440}])
+
+    body = {
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 5,
+        "draft": 1.0, "height": 0.0, "margin": 0.0,
+        "revision": rev, "berth_id": "D1", "work_minutes": 1,
+    }
+    r = _plan(client, body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 4
+    assert [l["seg_id"] for l in data["itinerary"]] == [s1, s2, s3, s4]
+    assert data["work_start_minute"] == 4 and data["work_end_minute"] == 5
+
+    # 确认复算一致
+    r = _confirm(client, data)
+    assert r.status_code == 201, r.text
+    assert [l["seg_id"] for l in r.json()["itinerary"]] == [s1, s2, s3, s4]

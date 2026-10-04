@@ -544,3 +544,40 @@ def test_reschedule_solves_with_current_controls(client):
     snap = client.get(f"/api/trips/{tid}").json()
     assert snap["itinerary"][0]["travel_time"] == 5
     assert snap["arrival_minute"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 正航时回路 × 分时航时：晚出发早到，三遍 DP 仍求最早抵达与字典序最优
+# ---------------------------------------------------------------------------
+
+def test_loop_with_time_dependent_travel_time(client):
+    # 1 A->B：基础航时 5，分钟 0 进入命中管制航时 5（分钟5到 B）；
+    #          分钟 1 进入航时 1（分钟2到 B，晚出发反而早到）。
+    # 2 B->C、3 C->B 航时均 1；4 B->D 深水航时 1，仅分钟 2..3 可进入前
+    # 先确保最早抵达 B 为分钟 2：若正向 DP 只按"首条路抵达"判最早，会误取
+    # 分钟 5；正确做法是等待到分钟 1 再发，分钟 4 抵达 D = 1(1→2)+4(3→4)。
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", travel_time=5, depth=99.0)
+    s2 = add_segment(client, "B", "C", travel_time=1, depth=99.0)
+    s3 = add_segment(client, "C", "B", travel_time=1, depth=99.0)
+    s4 = add_segment(client, "B", "D", travel_time=1, depth=99.0)
+    _put_controls(client, s1, [{"start_minute": 0, "end_minute": 1, "travel_time": 5},
+                              {"start_minute": 1, "end_minute": 2, "travel_time": 1}])
+    rev = seed_initial_revision(_level(0, 19, 3.0))
+
+    data = _plan(client, {
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 20,
+        "draft": 1.0, "height": 0.0, "margin": 0.0,
+        "revision": rev,
+    })
+    # 等待 1 分钟后以管制航时 1 出发；B 分钟 2 -> D 分钟 3
+    assert data["arrival_minute"] == 3
+    legs = data["itinerary"]
+    assert [(l["seg_id"], l["start_minute"], l["end_minute"], l["travel_time"])
+            for l in legs] == [
+        (s1, 1, 2, 1),
+        (s4, 2, 3, 1),
+    ]
+    assert data["total_wait_minutes"] == 1

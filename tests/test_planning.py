@@ -92,6 +92,71 @@ def test_tie_break_multi_edge_sequence(client):
     assert [(l["start_minute"], l["end_minute"]) for l in data["itinerary"]] == [(0, 1), (1, 2)]
 
 
+def test_tie_break_positive_time_loop_prefix_not_pruned(client):
+    # 正航时回路：1 A->B、2 B->C、3 C->B、4 B->D，航时均 1 分钟。
+    # 1..3 在分钟 0..3 全程可行，4 仅进入分钟 3 满足水深（其余分钟低潮）。
+    # 从 A 于分钟 0 起、窗口 4 分钟：
+    #   [1,4]      = 1→4，0 出发到 B(1)，等待至 3 进 4，分钟 4 抵达 D；
+    #   [1,2,3,4]  = 1→2→3 回路后到 B 仍是分钟 3（1 与 (1,2,3) 在
+    #                (B, 分钟3) 会合，旧剪枝误删较长前缀），分钟 4 抵达 D。
+    # 两者抵达相同，完整序列 (1,2,3,4) < (1,4)，等待不计入序列。
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1)
+    s2 = add_segment(client, "B", "C", 1)
+    s3 = add_segment(client, "C", "B", 1)
+    s4 = add_segment(client, "B", "D", 1, depth=0.5)
+    # 分钟 0..2 潮位 0（4 水深 0.5 < 吃水 1，不可行），分钟 3 潮位 3（4 可行）；
+    # 1..3 为深水（99）不受潮位影响
+    levels = {**_level(0, 2, 0.0), 3: 3.0}
+    rev = seed_initial_revision(levels)
+
+    body = {
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 4,
+        "draft": 1.0, "height": 0.0, "margin": 0.0,
+        "revision": rev,
+    }
+    r = client.post("/api/trips/plan", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 4
+    assert [l["seg_id"] for l in data["itinerary"]] == [s1, s2, s3, s4]
+    assert [(l["start_minute"], l["end_minute"]) for l in data["itinerary"]] == [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+    ]
+    assert data["total_wait_minutes"] == 0
+
+    # 单船确认复算与预排一致（提交该序列应复核通过）
+    r = client.post("/api/trips/confirm", json=data)
+    assert r.status_code == 201, r.text
+    confirmed = r.json()
+    assert [l["seg_id"] for l in confirmed["itinerary"]] == [s1, s2, s3, s4]
+    assert confirmed["arrival_minute"] == 4
+
+
+def test_earliest_arrival_still_outranks_lex_order(client):
+    # 回路方案即使字典序更优也不得取代更早抵达：4 在分钟 1 即可进入，
+    # [1,4] 分钟 2 到 D；回路 [1,2,3,...] 最快分钟 4 才回到 B，应仍取 [1,4]。
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1)
+    add_segment(client, "B", "C", 1)
+    add_segment(client, "C", "B", 1)
+    s4 = add_segment(client, "B", "D", 1)
+    seed_initial_revision(_level(0, 5, 3.0))
+
+    r = client.post("/api/trips/plan", json={
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 6,
+        "draft": 1.0, "height": 0.0, "margin": 0.0,
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 2
+    assert [l["seg_id"] for l in data["itinerary"]] == [s1, s4]
+
+
 # ---------------------------------------------------------------------------
 # 3. 桥底净空约束
 # ---------------------------------------------------------------------------

@@ -3,7 +3,8 @@
 基于 **Python + FastAPI + SQLite** 的潮汐窗口航路规划服务。录入港口节点、单向航段
 （正整数分钟航时、静水深度、可选桥底净空）与逐分钟潮位后，给定船舶吃水、水面以上
 高度、安全余量及不超过 1440 分钟的规划窗口，计算**最早抵达**行程；同一抵达时刻按
-**航段编号序列字典序**择优。规划同时执行**航段独占**：两艘已确认船舶不得在同一航段
+**完整航段编号序列**做字典序择优（节点等待不产生航段编号、不计入序列）。规划同时
+执行**航段独占**：两艘已确认船舶不得在同一航段
 的同一分钟占用（每段从进入分钟 `d` 到抵达前一分钟 `d+t-1` 独占；节点等待不占航段），
 既有已确认快照即使彼此重叠也原样保留、作为后续规划必须避开的占用。潮位以**修订号**
 版本化管理，分两类：
@@ -122,6 +123,22 @@
 **新行程待另行开单**。响应给出新旧行程号、复算行程与冲销状态。**同键同内容
 重试返回首次结果**（`replayed=true`，即使此后修订又变化也先重放），同键异内容
 `RESCHEDULE_KEY_CONFLICT`。原确认快照、批次幂等记录及现有接口契约保持不变。
+
+**本轮修复：正航时回路下同刻字典序航路丢失**。旧 DP 对每个状态
+`(节点, 分钟)` 只保留字典序最小的航段编号前缀；但航段航时均为正整数，
+正航时回路（如 `B→C→B`）会让**长度不同**的序列在同一 `(节点, 分钟)` 会合，
+当较短序列恰是较长序列的前缀时，旧剪枝会反转追加同一后缀后的字典序关系，
+从而把同刻字典序最小的**完整**航路误删。修复后规划改为三遍时间展开 DP：
+①正向可达求**最早抵达**（第一目标不变）；②反向可达标记仍能按时抵达/开工
+的状态；③自起点贪心重建，在等待与各可行航段导出的**完整序列**间取字典序
+最小者（等待不产生编号、不计入序列）。潮位误差带、分时航时、航段及狭窄水
+道组独占、终点泊位作业约束仍是可行性判断的一部分，语义不变。例：航段
+1 `A→B`、2 `B→C`、3 `C→B`、4 `B→D` 各耗时 1 分钟，1～3 在分钟 0～3 可
+通行，4 仅分钟 3 满足水深；从 A 于分钟 0 起、窗口 4 分钟，旧结果
+`[1,4]`，修复后 `[1,2,3,4]`，两者均于分钟 4 抵达。单船预排/确认复算与
+批次预排/确认共用同一规划内核，结果保持一致；**已确认快照不改写**，请求/
+响应字段、错误码、批次幂等重放与改期幂等重放均保持兼容（见
+[5. 算法说明](#5-算法说明)）。
 
 ---
 
@@ -256,8 +273,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 水深：`静水深度 + 名义潮位 − 误差 ≥ 吃水 + 安全余量`
   - 桥高（仅当该航段有桥）：`桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量`
   - 独占：该 `(航段, 分钟)` 未被其他已确认快照占用
-- **择优**：到达分钟最小；同一到达分钟，按航段编号（`seg_id`，自增）组成的序列做
-  字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）。
+- **择优**：到达分钟最小；同一到达分钟，按航段编号（`seg_id`，自增）组成的**完整
+  序列**做字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）；节点等待
+  不产生航段编号、不计入序列。正航时回路可能使长度不同的序列在同一 `(节点, 分钟)`
+  会合，规划不再因此剪掉较长前缀（三遍 DP，见算法说明）。
 - **潮位修订**：修订号自增、内容不可变，分两种提交方式（均可省略 `base_revision`
   而默认基于**最新**修订；未知基础修订报 `TIDE_REVISION_NOT_FOUND`）：
   - **名义潮位更正** `/api/tide/corrections`：全量继承基础修订的名义潮位与误差，
@@ -2219,6 +2238,69 @@ stale = requests.post(f"{B}/api/trips/confirm", json=plan)
 assert stale.status_code == 409 and stale.json()["error"]["code"] == "PLAN_MISMATCH"
 ```
 
+本轮修复示例（正航时回路：最早抵达优先，同刻按**完整**航段编号序列字典序）：
+
+```bash
+# 自定义 4 节点 + 回路图：1 A->B、2 B->C、3 C->B、4 B->D，各耗时 1 分钟
+for n in A B C D; do
+  curl -s -X POST $BASE/api/nodes -H 'Content-Type: application/json' \
+    -d "{\"node_id\":\"$n\"}" >/dev/null
+done
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","travel_time":1,"depth":99}' >/dev/null   # seg 1
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"B","destination":"C","travel_time":1,"depth":99}' >/dev/null   # seg 2
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"C","destination":"B","travel_time":1,"depth":99}' >/dev/null   # seg 3
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"B","destination":"D","travel_time":1,"depth":0.5}' >/dev/null  # seg 4：浅水
+# 潮位：先用初始化脚本/直接写库生成修订 #1（分钟 0..7 名义潮位 0），再以
+# 名义潮位更正把分钟 3..7 抬到 3.0，得到修订 #2（分钟 0..2 低潮，seg 4
+# 水深 0.5 < 吃水 1.0 不可行；分钟 3 高潮，进入 seg 4 占用分钟 3 可行）。
+# 演示库本身即有修订 #1（分钟 0..1439），可直接对其更正：
+curl -s -X POST $BASE/api/tide/corrections -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"corrections":{"3":3.0,"4":3.0,"5":3.0,"6":3.0,"7":3.0}}'
+# 规划：从 A 于分钟 0 起、窗口 8 分钟、按修订 #2（seg 4 仅分钟 3 的航程可行）
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":8,
+  "draft":1.0,"height":0.0,"margin":0.0,"revision":2}'
+# -> {"arrival_minute":4,"total_wait_minutes":0,
+#     "itinerary":[
+#       {"seg_id":1,"origin":"A","destination":"B","start_minute":0,"end_minute":1,"travel_time":1},
+#       {"seg_id":2,"origin":"B","destination":"C","start_minute":1,"end_minute":2,"travel_time":1},
+#       {"seg_id":3,"origin":"C","destination":"B","start_minute":2,"end_minute":3,"travel_time":1},
+#       {"seg_id":4,"origin":"B","destination":"D","start_minute":3,"end_minute":4,"travel_time":1}]}
+# 旧实现会在 (B, 分钟3) 把较长前缀 (1,2,3) 剪掉而返回 [1,4]（先在 B 等到
+# 分钟 3）；修复后两条航路同于分钟 4 抵达，完整序列 (1,2,3,4) < (1,4)。
+# 把该响应原样 POST /api/trips/confirm 即与复算一致地确认（201）；批次
+# /api/trips/batch/plan 与 /api/trips/batch/confirm 结果相同。
+```
+
+```python
+# 同一场景的 Python 调用（requests）
+import requests
+
+B = "http://localhost:8000"
+for n in ("A", "B", "C", "D"):
+    requests.post(f"{B}/api/nodes", json={"node_id": n})
+for o, d, depth in [("A", "B", 99), ("B", "C", 99), ("C", "B", 99), ("B", "D", 0.5)]:
+    requests.post(f"{B}/api/segments",
+                  json={"origin": o, "destination": d, "travel_time": 1, "depth": depth})
+# 演示库自带修订 #1（0..1439）；把分钟 3..7 抬到高潮生成修订 #2
+rev = requests.post(f"{B}/api/tide/corrections",
+                    json={"base_revision": 1,
+                          "corrections": {3: 3.0, 4: 3.0, 5: 3.0, 6: 3.0, 7: 3.0}}).json()["revision"]
+plan = requests.post(f"{B}/api/trips/plan", json={
+    "origin": "A", "destination": "D", "start_minute": 0, "window_minutes": 8,
+    "draft": 1.0, "height": 0.0, "margin": 0.0, "revision": rev,
+}).json()
+assert [leg["seg_id"] for leg in plan["itinerary"]] == [1, 2, 3, 4]
+assert plan["arrival_minute"] == 4 and plan["total_wait_minutes"] == 0
+# 确认复算一致
+r = requests.post(f"{B}/api/trips/confirm", json=plan)
+assert r.status_code == 201
+```
+
 录入自定义数据：
 
 ```bash
@@ -2242,15 +2324,37 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    该实际航程是否全程满足误差带约束（水深 `深度+名义−误差`、净空
    `净空−名义−误差`）**且无任何一分钟被其他已确认快照占用**、且不越出窗口，
    查询为 O(1)；
-3. 状态 `(节点, 分钟)` 只保留一个值：到达该状态的航段编号序列中**字典序最小**者。
-   转移有两种：
-   - 等待：同一节点序列不变推进到下一分钟；
-   - 出发：在该节点的整分钟进入可行航段，序列追加该航段编号；
-4. 按分钟递增处理，终点第一次出现的分钟即最早抵达，其序列即同到达时刻字典序最优；
-5. 回溯父指针，输出每段的进入/抵达分钟。
+3. 时间展开**三遍 DP**（状态 `(节点, 分钟)`）：
+   - **第一遍（正向可达，求最早抵达）**：只记录可达性、不保留序列。转移为
+     等待（同一节点推进到下一分钟，不追加任何编号）与出发（在该节点的整
+     分钟进入可行航段，落入更晚分钟）。终点为吸收态：非泊位模式终点首次
+     可达分钟即最早抵达 `T`；泊位模式按分钟升序取首个泊位作业可行的新鲜
+     抵达。分时航时下"晚出发反而早到"也按抵达分钟升序被发现（展开自更早
+     迭代，航时恒为正整数）；
+   - **第二遍（反向可达）**：判定每个 `(节点, 分钟)` 是否仍能恰于 `T` 抵达
+     终点（终点只在 `(终点, T)` 可接受——更早抵达不可等待、更晚非最早）；
+     并为每条航段预处理"不早于当前分钟的下一个既全程可行、到达点状态又能
+     按时完成的进入分钟"（倒序 O(1) 继承）；
+   - **第三遍（贪心重建）**：自 `(起点, 0)` 起，在"等待"（不追加编号）与
+     各可行航段（追加该段编号）所导出的**完整序列**中取字典序最小者。同一
+     航段的多个可进入分钟里取最早者：在同一节点，晚一刻可导出的序列集合是
+     早一刻的子集（等待不增加任何航段编号），最早进入分钟的后缀字典序必不
+     更差；
+4. 沿重建结果输出每段的进入/抵达分钟；中间跳过的分钟即节点等待。
 
-剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
-故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
+> **为什么不能对 `(节点, 分钟)` 只保留字典序最小前缀**（旧实现的缺陷）：
+> 所有航段航时均为正整数，**正航时回路**会让长度不同的序列在同一
+> `(节点, 分钟)` 会合；当较短序列恰是较长序列的**前缀**时，二者追加同一
+> 后缀后字典序大小关系会**反转**（Python 序列比较把短前缀判小，但
+> `s1+x` 与 `s2+x` 在 `s1` 为 `s2` 前缀时以后缀首个编号决胜）。旧剪枝因此
+> 会把全局字典序最小的完整航路误删。例：航段 1 `A→B`、2 `B→C`、
+> 3 `C→B`、4 `B→D` 各耗时 1 分钟，1～3 在分钟 0～3 可通行，4 仅分钟 3
+> 满足水深；从 A 于分钟 0 起、窗口 4 分钟，`(1)` 与 `(1,2,3)` 在
+> `(B, 分钟3)` 会合，旧实现返回 `[1,4]`，修复后返回同刻（分钟 4）抵达的
+> `[1,2,3,4]`——完整序列 `(1,2,3,4) < (1,4)`，中间等待不产生编号、不计
+> 入序列。三遍 DP 只做"能否按时到达"的可达剪枝（同一 `(节点, 分钟)` 的
+> 可行后续完全相同），不比较前缀，故不会丢失任何完整航路。复杂度
+> O(W·E)（W≤1440）。
 
 ### 终点泊位与开放日历（实现见 `app/services/berths.py`、`planning.py`）
 
@@ -2267,10 +2371,11 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    （已作废快照经 `voided_trips` 过滤即时释放；批次另把前船复算作业区间
    并入内存占用）。
 3. **DP 调整**：船抵达终点即开工、不能在终点等待——泊位模式下终点是
-   "吸收态"：等待传播与航段展开均跳过终点，落入终点的航段记录为"新鲜
-   抵达"（同刻只保留字典序最小航段序列）；按分钟升序第一个作业可行的
-   新鲜抵达即最优（最早抵达 + 同刻序列择优）。未指定泊位时 DP 与旧版逐
-   行一致，响应仅补 4 个 `null` 泊位字段。
+   "吸收态"：等待传播与航段展开均不经过终点，落入终点的航段在对应抵达
+   分钟标记为"新鲜抵达"。第一遍正向 DP 按分钟升序取首个泊位作业可行的
+   新鲜抵达分钟 `T`；第二/三遍在"终点仅 `(终点, T)` 可接受"的边界下做
+   反向可达与完整序列字典序贪心（正航时回路同样不再误剪前缀）。未指定
+   泊位时 DP 同样按三遍算法执行，响应仅补 4 个 `null` 泊位字段。
 4. 确认（单船/批次）在原事务内以当时日历与泊位占用复算，除行程逐段一致
    外还比对泊位与作业分钟（不一致 `PLAN_MISMATCH`，批次全批回滚）；通过
    后把 `berth_id/work_minutes/work_start_minute/work_end_minute` 写入
