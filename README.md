@@ -123,6 +123,22 @@
 重试返回首次结果**（`replayed=true`，即使此后修订又变化也先重放），同键异内容
 `RESCHEDULE_KEY_CONFLICT`。原确认快照、批次幂等记录及现有接口契约保持不变。
 
+**本轮修复同刻字典序最优航路丢失**：旧规划算法在每个（节点, 分钟）状态上
+只保留字典序最小的航段编号序列，把其余前缀剪掉。正航时回路下，同一状态
+的两条序列可能**互为前缀**（短者字典序更小），但追加同一段后续航段后大小
+关系会反转——例如航段 `1:A→B、2:B→C、3:C→B、4:B→D` 均耗时 1 分钟，1~3 在
+分钟 0..3 可通行、4 仅分钟 3 满足水深，从 A 于分钟 0 起、窗口 4 分钟：
+`(1,)` 与 `(1,2,3)` 于分钟 3 同时位于 B，旧算法剪掉 `(1,2,3)` 而返回
+`[1,4]`；但两者均于分钟 4 抵达，而 `(1,2,3,4)` 字典序小于 `(1,4)`，正确
+答案应为 `[1,2,3,4]`。修复后规划分两阶段：先按分钟展开的**可达性** DP 求
+最早抵达分钟（泊位模式下为首个泊位作业可行的新鲜抵达分钟），再在「恰于
+该分钟抵达」的全部行程中以**反向可达 + 正向贪心**求字典序最小的完整航段
+编号序列（等待仍不计入序列）。择优口径不变——**先取最早抵达，再比较完整
+航段编号序列**；潮位误差带、分时航时、航段及狭窄水道组占用、终点泊位作业
+约束照常参与可行性判断。单船预排/确认复算、批次预排/确认复算共用同一实现，
+结果一致；已确认快照不改写，全部既有接口的请求、响应、错误码与批次幂等
+重放语义保持兼容。
+
 ---
 
 ## 1. 启动
@@ -257,7 +273,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 桥高（仅当该航段有桥）：`桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量`
   - 独占：该 `(航段, 分钟)` 未被其他已确认快照占用
 - **择优**：到达分钟最小；同一到达分钟，按航段编号（`seg_id`，自增）组成的序列做
-  字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）。
+  字典序比较，序列小者优先（先比较首段编号，相同再比较下一段；一序列是另一序列
+  的前缀时短者更小）。比较的是**完整航段编号序列**——同一（节点, 分钟）上互为
+  前缀的多条序列（正航时回路）都参与最终比较，不做单序列剪枝；等待不计入序列。
 - **潮位修订**：修订号自增、内容不可变，分两种提交方式（均可省略 `base_revision`
   而默认基于**最新**修订；未知基础修订报 `TIDE_REVISION_NOT_FOUND`）：
   - **名义潮位更正** `/api/tide/corrections`：全量继承基础修订的名义潮位与误差，
@@ -618,6 +636,20 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
+> **本轮用法（同刻字典序最优航路修复）**：无新增/变更端点，全部既有接口的
+> 请求、响应与错误码保持不变——仅 `POST /api/trips/plan`、
+> `POST /api/trips/confirm`、`POST /api/trips/batch/plan`、
+> `POST /api/trips/batch/confirm` 的**求解结果**在含正航时回路的场景下
+> 可能变化：同一（节点, 分钟）上互为前缀的较长航段序列不再被剪掉，
+> 同一抵达分钟按**完整航段编号序列**字典序择优（先最早抵达，再比较序列；
+> 等待不计入序列）。例：航段 `1:A→B、2:B→C、3:C→B、4:B→D` 均 1 分钟，
+> 1~3 分钟 0..3 可通行、4 仅分钟 3 水深足够，A 于分钟 0 起、窗口 4 分钟，
+> 旧返回 `[1,4]`，现返回 `[1,2,3,4]`（均分钟 4 抵达，`(1,2,3,4)` 字典序
+> 更小）。潮位误差带、分时航时、航段/水道组占用、泊位作业约束的可行性
+> 口径不变；单船与批次的预排、确认复算结果一致；已确认快照不改写，
+> 批次幂等重放语义不变。调用示例见下文「同刻字典序最优航路请求 / 响应
+> 示例（本轮）」。
+>
 > **本轮用法（不安全航次改期确认）**：新增 1 个写接口
 > `POST /api/trips/{trip_id}/reschedule`；既有全部接口路径、请求/响应契约
 > 不变（只读复核 `/review` 仅内部函数拆分、行为完全一致）——
@@ -861,6 +893,66 @@ POST /api/tide/error-revisions
 规划/确认/复核携带该修订号时，水深按 `名义−误差`、净空按 `名义+误差` 的保守极值
 核验；确认冲突（`REVISION_STALE`）、择优（最早抵达 + 航段序列字典序）、响应字段
 均与既有规则一致。
+
+### 同刻字典序最优航路请求 / 响应示例（本轮）
+
+正航时回路下，同一（节点, 分钟）可存在互为前缀的多条航段序列，修复后按
+**完整航段编号序列**字典序择优。搭建示例场景：
+
+```bash
+BASE=http://localhost:8000
+# 节点 A/B/C/D
+for n in A B C D; do
+  curl -s -X POST $BASE/api/nodes -H 'Content-Type: application/json' \
+    -d "{\"node_id\":\"$n\"}"
+done
+# 航段 1:A→B、2:B→C、3:C→B（静水深 4.6，低潮可通行）、4:B→D（静水深 4.0），均 1 分钟
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","travel_time":1,"depth":4.6}'
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"B","destination":"C","travel_time":1,"depth":4.6}'
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"C","destination":"B","travel_time":1,"depth":4.6}'
+curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
+  -d '{"origin":"B","destination":"D","travel_time":1,"depth":4.0}'
+```
+
+潮位修订 #1（初始修订随库直接导入，与演示数据/测试同一方式；后续修订仍走
+`/api/tide/corrections`、`/api/tide/error-revisions`）：分钟 0..2 潮位 0、
+分钟 3 潮位 10（吃水 4.0 + 余量 0.5 时，航段 1~3 全程可通行，航段 4 仅
+分钟 3 水深足够）。规划：
+
+```bash
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":4,
+  "draft":4.0,"height":2.5,"margin":0.5,"revision":1}'
+```
+
+`[1,4]`（分钟 0 走航段 1 后在 B 等待、分钟 3 走航段 4）与 `[1,2,3,4]`
+（B→C→B 回路后再走航段 4）均于分钟 4 抵达；字典序 `(1,2,3,4) < (1,4)`，
+响应返回后者（`total_wait_minutes` 为 0，等待不计入序列）：
+
+```json
+{
+  "revision": 1, "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 4,
+  "draft": 4.0, "height": 2.5, "margin": 0.5,
+  "ship_no": null, "ship_version": null,
+  "berth_id": null, "work_minutes": null,
+  "work_start_minute": null, "work_end_minute": null,
+  "arrival_minute": 4, "total_wait_minutes": 0,
+  "itinerary": [
+    {"seg_id": 1, "origin": "A", "destination": "B", "start_minute": 0, "end_minute": 1, "travel_time": 1},
+    {"seg_id": 2, "origin": "B", "destination": "C", "start_minute": 1, "end_minute": 2, "travel_time": 1},
+    {"seg_id": 3, "origin": "C", "destination": "B", "start_minute": 2, "end_minute": 3, "travel_time": 1},
+    {"seg_id": 4, "origin": "B", "destination": "D", "start_minute": 3, "end_minute": 4, "travel_time": 1}
+  ]
+}
+```
+
+将该响应原样回填 `POST /api/trips/confirm` 得 `201`（事务内复算逐段一致）；
+`POST /api/trips/batch/plan` / `POST /api/trips/batch/confirm` 对同场景给出
+与单船一致的 `[1,2,3,4]`，批次同键重放仍返回首次结果。
 
 ### 航段分时航时管制请求 / 响应示例（本轮新增）
 

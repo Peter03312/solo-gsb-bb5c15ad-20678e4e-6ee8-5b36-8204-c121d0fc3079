@@ -12,9 +12,17 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 等待不占用航段，不参与校验。
 
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
-算法：窗口 <= 1440 分钟，按时间展开 DP，每个 (节点, 分钟) 只保留字典序
-最小的航段编号序列。该性质可安全剪枝——任何延续在相同状态上叠加后，
-前缀字典序大小关系不变。
+算法：窗口 <= 1440 分钟，分两阶段——
+  1) 按时间展开的可达性 DP 求最早抵达分钟（泊位模式：首个泊位作业可行的
+     新鲜抵达分钟）。可达性与历史无关，此阶段不含任何序列剪枝；
+  2) 在「恰于该分钟抵达」的全部行程中求字典序最小的航段编号序列：先做
+     反向可达 DP（终点为吸收态），再正向贪心——当前位置集合恒可压缩为
+     「单一节点 + 分钟下界」，每步取可走的最小编号航段、以该航段最早的
+     可行进入分钟进入。
+注意：不能沿用「每个 (节点, 分钟) 只保留字典序最小序列」的剪枝——正航时
+回路下，同一状态的两条序列可能互为前缀（短者字典序更小），但追加同一段
+后续航段后大小关系会反转（如 (1,) 与 (1,2,3) 同刻位于 B，追加航段 4 后
+(1,4) 反而大于 (1,2,3,4)），剪枝会丢失最终同刻字典序最小的航路。
 """
 import json
 from dataclasses import dataclass
@@ -284,44 +292,34 @@ def find_itinerary(
         blocked=blocked, controls=controls,
     )
 
-    # 5) 按分钟展开的 DP
-    # states[t-local] : 节点 -> 到达该节点该分钟的最优（字典序最小）航段编号序列
-    # parents[...]     : 节点 -> (前一局部分钟, 进入所用航段 seg_id 或 None=等待)
+    # 5) 第一阶段：按分钟展开的可达性 DP，求最早抵达分钟（局部）。
+    #    只记录「该分钟能到达哪些节点」，不记录航段序列——同一 (节点, 分钟)
+    #    可能同时存在互为前缀的多条序列（正航时回路），任何单序列剪枝都可能
+    #    丢失延续后的最优解；序列在第二阶段精确求出。
     #
-    # 泊位模式下终点是"吸收态"：船一旦抵达终点即开工，不能在终点等待或再出
-    # 发。故终点的到达只可能来自某条航段（fresh arrivals），不做等待传播、
-    # 也不从终点展开任何航段；每个局部分钟只保留该分钟新鲜抵达中字典序最小
-    # 的航段序列。非泊位模式保持原有等待传播与首次抵达即最优的提前终止。
+    #    泊位模式下终点是"吸收态"：船一旦抵达终点即开工，不能在终点等待或再
+    #    出发。故落入终点的航段只记入 fresh_dest（新鲜抵达分钟），终点从不
+    #    进入 states，也不从终点展开任何航段。
     n = window_minutes
-    states: list[dict[str, tuple]] = [dict() for _ in range(n + 1)]
-    parents: list[dict[str, tuple]] = [dict() for _ in range(n + 1)]
-    fresh_dest: dict[int, tuple] = {}       # 泊位模式：局部分钟 -> 新鲜抵达序列
-    fresh_parents: dict[int, tuple] = {}    # 泊位模式：局部分钟 -> (前局部分钟, seg_id)
-    states[0][origin] = ()
+    states: list[set[str]] = [set() for _ in range(n + 1)]
+    fresh_dest: set[int] = set()    # 泊位模式：新鲜抵达终点的局部分钟
+    states[0].add(origin)
 
     arrival_local = None
     for i in range(n + 1):
-        # 5.1 等待：从 i-1 原样延续到 i（同序列，不加航段编号）。
-        #     泊位模式终点不等待（抵达即开工），故等待传播跳过终点。
+        # 5.1 等待：从 i-1 原样延续到 i（泊位模式终点不在 states，天然不等待）。
         if i > 0:
-            for v, seq in states[i - 1].items():
-                if berth_mode and v == destination:
-                    continue
-                if v not in states[i] or seq < states[i][v]:
-                    states[i][v] = seq
-                    parents[i][v] = (i - 1, None)
+            states[i] |= states[i - 1]
 
-        # 5.2 非泊位模式：终点首次出现即为最早到达，此刻其序列必为该到达
-        #     时刻字典序最优。泊位模式改为扫描全部新鲜抵达（见 5.4）。
+        # 5.2 非泊位模式：终点首次出现即为最早到达。泊位模式改为扫描全部
+        #     新鲜抵达（见 5.4）。
         if not berth_mode and destination in states[i]:
             arrival_local = i
             break
 
         # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）。
         #     泊位模式不从终点出发；落入终点的航段写入 fresh_dest。
-        for v, seq in states[i].items():
-            if berth_mode and v == destination:
-                continue
+        for v in states[i]:
             for s in out_segs.get(v, []):
                 t = travel_at[s.seg_id][i]
                 j = i + t
@@ -329,20 +327,12 @@ def find_itinerary(
                     continue
                 if not feasible[s.seg_id][i]:
                     continue
-                cand = seq + (s.seg_id,)
                 if berth_mode and s.destination == destination:
-                    old = fresh_dest.get(j)
-                    if old is None or cand < old:
-                        fresh_dest[j] = cand
-                        fresh_parents[j] = (i, s.seg_id)
-                    continue
-                old = states[j].get(s.destination)
-                if old is None or cand < old:
-                    states[j][s.destination] = cand
-                    parents[j][s.destination] = (i, s.seg_id)
+                    fresh_dest.add(j)
+                else:
+                    states[j].add(s.destination)
 
-        # 5.4 泊位模式：按分钟升序，首个泊位作业可行的新鲜抵达即全局最优
-        #     （最早抵达；同刻新鲜抵达已只保留字典序最小序列）。
+        # 5.4 泊位模式：按分钟升序，首个泊位作业可行的新鲜抵达分钟即最早抵达。
         if berth_mode and i in fresh_dest:
             arrival_abs = start_minute + i
             if _berth_window_ok(arrival_abs, berth, berth_occupied, horizon):
@@ -352,31 +342,11 @@ def find_itinerary(
     if arrival_local is None:
         raise no_itinerary(origin, destination)
 
-    # 6) 回溯每段起止分钟
-    if berth_mode:
-        # 泊位模式：终点这一步取自 fresh_parents，其后在非终点节点上按
-        # parents 回溯（终点从未进入 states/parents）。
-        legs: list[tuple[int, int, int]] = []
-        prev_i, seg_id = fresh_parents[arrival_local]
-        legs.append((seg_id, prev_i, arrival_local))
-        v, i = segs[seg_id].origin, prev_i
-        while not (v == origin and i == 0):
-            pi, pid = parents[i][v]
-            if pid is not None:
-                legs.append((pid, pi, i))
-                v = segs[pid].origin
-            i = pi
-        legs.reverse()
-    else:
-        legs = []
-        v, i = destination, arrival_local
-        while not (v == origin and i == 0):
-            prev_i, seg_id = parents[i][v]
-            if seg_id is not None:
-                legs.append((seg_id, prev_i, i))
-                v = segs[seg_id].origin
-            i = prev_i
-        legs.reverse()
+    # 6) 第二阶段：在「恰于 arrival_local 抵达终点」的全部可行行程中，取航段
+    #    编号序列字典序最小者及其各段进入分钟（详见 _lexicographic_legs）。
+    legs = _lexicographic_legs(
+        out_segs, feasible, travel_at, origin, destination, arrival_local
+    )
 
     leg_dicts = [
         {
@@ -398,6 +368,100 @@ def find_itinerary(
     _attach_berth(result, berth if berth_mode else None,
                   start_minute + arrival_local)
     return result
+
+
+def _lexicographic_legs(
+    out_segs: dict[str, list[Segment]],
+    feasible: dict[int, list[bool]],
+    travel_at: dict[int, list[int]],
+    origin: str,
+    destination: str,
+    arrival_local: int,
+) -> list[tuple[int, int, int]]:
+    """恰于局部抵达分钟 arrival_local 到达终点的全部可行行程中，求航段编号
+    序列字典序最小者，返回 [(seg_id, 进入局部分钟, 抵达局部分钟), ...]。
+
+    同一 (节点, 分钟) 可能同时存在互为前缀的多条航段序列（正航时回路：短
+    序列是长序列的前缀、字典序更小，但两者追加同一段后续后大小关系可能
+    反转），因此不能按状态剪枝保留单条序列。正确做法分两步：
+
+    1) 反向可达 DP：can_reach[v][i] 表示「局部分钟 i 位于节点 v（可等待）
+       时，能否恰于 arrival_local 抵达终点」。终点视为吸收态——早于
+       arrival_local 抵达终点行程即已结束（泊位模式本就不能在终点等待/
+       再出发；非泊位模式若更早抵达则与 arrival_local 的最早性矛盾），
+       故 can_reach(终点, j) ⟺ j == arrival_local；
+    2) 正向贪心：当前位置集合恒可压缩为「单一节点 v + 分钟下界 τ」（在 v
+       可于 τ 之后任意整分钟等待）。每一步在所有「τ 之后仍存在可续进入
+       分钟」的出航段中取最小编号者，并以该航段**最早**的可续进入分钟
+       进入。进入分钟 i 可续当且仅当：航段于 i 进入可行（潮位误差带/
+       占用/管制/窗口）、i 本身可续（can_reach[v][i]，即可由当前前缀经
+       等待到达）且抵达后仍能恰于 arrival_local 到达终点。
+    """
+    m = arrival_local
+
+    # 1) 反向可达性（只需有出航段的节点；终点吸收、无出航段的节点恒不可达）
+    can_reach: dict[str, list[bool]] = {
+        v: [False] * (m + 1) for v in out_segs if v != destination
+    }
+
+    def reach(node: str, j: int) -> bool:
+        if node == destination:
+            return j == m
+        cr = can_reach.get(node)
+        return cr is not None and cr[j]
+
+    for i in range(m - 1, -1, -1):
+        for v, cr in can_reach.items():
+            ok = cr[i + 1]  # 在节点等待一分钟
+            if not ok:
+                for s in out_segs[v]:
+                    t = travel_at[s.seg_id][i]
+                    if (feasible[s.seg_id][i] and i + t <= m
+                            and reach(s.destination, i + t)):
+                        ok = True
+                        break
+            cr[i] = ok
+
+    # 2) 各航段「不小于 i 的最早可续进入分钟」（无则 None），O(1) 查询
+    next_good: dict[int, list[Optional[int]]] = {}
+    for v, segs_out in out_segs.items():
+        if v == destination:
+            continue
+        cr_v = can_reach[v]
+        for s in segs_out:
+            tt = travel_at[s.seg_id]
+            fs = feasible[s.seg_id]
+            nxt: list[Optional[int]] = [None] * (m + 2)  # m+1 为哨兵 None
+            for i in range(m, -1, -1):
+                t = tt[i]
+                if (fs[i] and cr_v[i] and i + t <= m
+                        and reach(s.destination, i + t)):
+                    nxt[i] = i
+                else:
+                    nxt[i] = nxt[i + 1]
+            next_good[s.seg_id] = nxt
+
+    # 3) 正向贪心：不变式为 can_reach(v, τ) 为真，故每步必有可走航段
+    legs: list[tuple[int, int, int]] = []
+    v, tau = origin, 0
+    while v != destination:
+        best_s: Optional[Segment] = None
+        best_i = 0
+        for s in out_segs.get(v, []):
+            nxt = next_good.get(s.seg_id)
+            if nxt is None:
+                continue
+            i = nxt[tau]
+            if i is None:
+                continue
+            if best_s is None or s.seg_id < best_s.seg_id:
+                best_s, best_i = s, i
+        if best_s is None:  # 不会到达：第一阶段已保证可达，此处仅为防御
+            raise no_itinerary(origin, destination)
+        t = travel_at[best_s.seg_id][best_i]
+        legs.append((best_s.seg_id, best_i, best_i + t))
+        v, tau = best_s.destination, best_i + t
+    return legs
 
 
 def _berth_window_ok(arrival: int, berth: dict,

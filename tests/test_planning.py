@@ -326,3 +326,141 @@ def test_demo_seed(tmp_path, monkeypatch):
     ).fetchone()["c"]
     assert n_tide == 1440
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 12. 正航时回路：同一（节点, 分钟）不得剪掉互为前缀的较长序列
+# ---------------------------------------------------------------------------
+
+def _cycle_graph(client, levels=None):
+    """航段 1:A→B、2:B→C、3:C→B、4:B→D 均 1 分钟；1~3 分钟 0..3 可通行，
+    4 仅分钟 3 水深足够（静水深 4.0，需潮位 ≥0.5；1~3 静水深 4.6 全程够）。"""
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1, depth=4.6)
+    s2 = add_segment(client, "B", "C", 1, depth=4.6)
+    s3 = add_segment(client, "C", "B", 1, depth=4.6)
+    s4 = add_segment(client, "B", "D", 1, depth=4.0)
+    assert (s1, s2, s3, s4) == (1, 2, 3, 4)
+    if levels is None:
+        levels = {0: 0.0, 1: 0.0, 2: 0.0, 3: 10.0}
+    rev = seed_initial_revision(levels)
+    return rev
+
+
+def _cycle_plan(client, rev):
+    return client.post("/api/trips/plan", json={
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 4,
+        "draft": 4.0, "height": 2.5, "margin": 0.5,
+        "revision": rev,
+    })
+
+
+def test_cycle_prefix_sequence_not_pruned(client):
+    # [1,4] 与 [1,2,3,4] 均于分钟 4 抵达；字典序 (1,2,3,4) < (1,4)。
+    # 旧实现把 (B, 分钟3) 的较长前缀 (1,2,3) 剪掉而误返回 [1,4]。
+    rev = _cycle_graph(client)
+    r = _cycle_plan(client, rev)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 4
+    assert [l["seg_id"] for l in data["itinerary"]] == [1, 2, 3, 4]
+    assert [(l["start_minute"], l["end_minute"]) for l in data["itinerary"]] == [
+        (0, 1), (1, 2), (2, 3), (3, 4)]
+    assert data["total_wait_minutes"] == 0
+
+
+def test_cycle_prefix_confirm_consistent(client):
+    # 确认复算与预排必须得到同一行程（同事务重算逐段一致）
+    rev = _cycle_graph(client)
+    planned = _cycle_plan(client, rev).json()
+    r = client.post("/api/trips/confirm", json=planned)
+    assert r.status_code == 201, r.text
+    saved = client.get(f"/api/trips/{r.json()['trip_id']}").json()
+    assert [l["seg_id"] for l in saved["itinerary"]] == [1, 2, 3, 4]
+    assert saved["arrival_minute"] == 4
+
+
+def test_cycle_prefix_batch_plan_and_confirm_consistent(client):
+    # 批次预排/确认复算与单船一致：回路航路 [1,2,3,4] 不丢失
+    rev = _cycle_graph(client)
+    ships = [
+        {"origin": "A", "destination": "D", "start_minute": 0,
+         "window_minutes": 4, "draft": 4.0, "height": 2.5, "margin": 0.5},
+        {"origin": "A", "destination": "B", "start_minute": 0,
+         "window_minutes": 4, "draft": 4.0, "height": 2.5, "margin": 0.5},
+    ]
+    r = client.post("/api/trips/batch/plan", json={"ships": ships, "revision": rev})
+    assert r.status_code == 200, r.text
+    plan = r.json()
+    assert [l["seg_id"] for l in plan["ships"][0]["itinerary"]] == [1, 2, 3, 4]
+    assert plan["ships"][0]["arrival_minute"] == 4
+
+    body = {
+        "ships": [
+            {**{k: s[k] for k in ("origin", "destination", "start_minute",
+                                  "window_minutes", "draft", "height", "margin")},
+             "itinerary": s["itinerary"]}
+            for s in plan["ships"]
+        ],
+        "revision": plan["revision"],
+        "idempotency_key": "cycle-batch-1",
+    }
+    r = client.post("/api/trips/batch/confirm", json=body)
+    assert r.status_code == 201, r.text
+    assert [l["seg_id"] for l in r.json()["trips"][0]["itinerary"]] == [1, 2, 3, 4]
+    # 同键重放仍返回首次结果
+    r2 = client.post("/api/trips/batch/confirm", json=body)
+    assert r2.status_code == 200
+    assert r2.json()["replayed"] is True
+
+
+def test_cycle_prefix_with_berth(client):
+    # 泊位模式同样不得剪掉互为前缀的较长序列
+    rev = _cycle_graph(client, {0: 0.0, 1: 0.0, 2: 0.0, 3: 10.0,
+                                4: 0.0, 5: 0.0})
+    r = client.post("/api/nodes/D/berths", json={"berth_id": "P1"})
+    assert r.status_code == 201, r.text
+    r = client.put("/api/berths/P1/calendar", json={
+        "intervals": [{"start_minute": 0, "end_minute": 10}]})
+    assert r.status_code == 200, r.text
+
+    r = client.post("/api/trips/plan", json={
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 6,
+        "draft": 4.0, "height": 2.5, "margin": 0.5,
+        "revision": rev, "berth_id": "P1", "work_minutes": 2,
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 4
+    assert [l["seg_id"] for l in data["itinerary"]] == [1, 2, 3, 4]
+    assert data["work_start_minute"] == 4
+    assert data["work_end_minute"] == 6
+
+
+def test_dead_end_edge_not_taken(client):
+    # 字典序更小的出航段若通往死路（无法抵达终点），必须跳过：
+    # 2:B→C 是死路，3:B→D 仅分钟 2 可通行，应等待后走 [1,3]
+    for n in ["A", "B", "C", "D"]:
+        add_node(client, n)
+    s1 = add_segment(client, "A", "B", 1, depth=4.6)
+    s2 = add_segment(client, "B", "C", 1, depth=4.6)
+    s3 = add_segment(client, "B", "D", 1, depth=4.0)
+    assert (s1, s2, s3) == (1, 2, 3)
+    rev = seed_initial_revision({0: 0.0, 1: 0.0, 2: 10.0, 3: 0.0, 4: 0.0})
+
+    r = client.post("/api/trips/plan", json={
+        "origin": "A", "destination": "D",
+        "start_minute": 0, "window_minutes": 5,
+        "draft": 4.0, "height": 2.5, "margin": 0.5,
+        "revision": rev,
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["arrival_minute"] == 3
+    assert [l["seg_id"] for l in data["itinerary"]] == [1, 3]
+    assert [(l["start_minute"], l["end_minute"]) for l in data["itinerary"]] == [
+        (0, 1), (2, 3)]
+    assert data["total_wait_minutes"] == 1
